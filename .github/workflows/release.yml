@@ -90,3 +90,17 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # The raw compiled binary is a fully portable Windows app: no installer,
+      # no admin rights — just download and run. (Requires the WebView2 runtime,
+      # which ships with Windows 10/11 by default.)
+      - name: Publish portable Windows exe
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp "src-tauri/target/release/clearcompare.exe" \
+             "ClearCompare_${GITHUB_REF_NAME}_x64_portable.exe"
+          gh release upload "${GITHUB_REF_NAME}" \
+             "ClearCompare_${GITHUB_REF_NAME}_x64_portable.exe" --clobber

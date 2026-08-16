@@ -13,7 +13,15 @@
       "Bash(git add *)",
       "Bash(git rm *)",
       "Bash(git commit -q -m 'Initial commit: ClearCompare — clean file & folder comparison *)",
-      "Bash(git remote *)"
+      "Bash(git remote *)",
+      "Bash(git push *)",
+      "Bash(ls -la ~/.ssh/ 2>/dev/null | grep -iE 'iamsrinath|\\\\.pub|config|id_' ; echo \"---all keys---\"; ls ~/.ssh/ 2>/dev/null)",
+      "Bash(git tag *)",
+      "Bash(git rev-list *)",
+      "Bash(echo \"local tag -> $\\(git rev-list -n1 v0.1.0\\)\")",
+      "Bash(git ls-remote *)",
+      "Bash(git commit -q -m 'ci: fix Linux deps — drop legacy libappindicator3-dev \\(conflicts with libayatana\\) *)",
+      "Bash(git commit -q -m 'windows: per-user NSIS install + publish portable exe \\(no admin needed\\) *)"
     ]
   }
 }
