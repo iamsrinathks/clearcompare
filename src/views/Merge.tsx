@@ -110,7 +110,9 @@ export default function Merge() {
         <PathPicker
           label="Base"
           value={base}
-          placeholder="Common ancestor…"
+          placeholder="Type or paste common ancestor path…"
+          onChange={setBase}
+          onCommit={(v) => run(v, left, right)}
           onPick={async () => {
             const p = await pickFile("Base (common ancestor)");
             if (p) {
@@ -122,7 +124,9 @@ export default function Merge() {
         <PathPicker
           label="Left"
           value={left}
-          placeholder="Your version…"
+          placeholder="Type or paste your version path…"
+          onChange={setLeft}
+          onCommit={(v) => run(base, v, right)}
           onPick={async () => {
             const p = await pickFile("Left version");
             if (p) {
@@ -134,7 +138,9 @@ export default function Merge() {
         <PathPicker
           label="Right"
           value={right}
-          placeholder="Their version…"
+          placeholder="Type or paste their version path…"
+          onChange={setRight}
+          onCommit={(v) => run(base, left, v)}
           onPick={async () => {
             const p = await pickFile("Right version");
             if (p) {

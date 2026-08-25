@@ -1,4 +1,4 @@
-use super::folder::{compare_folders, Node};
+use super::folder::{compare_folders_simple, Node};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -22,7 +22,7 @@ pub struct SyncPlan {
 
 /// mode: left_to_right | right_to_left | mirror_lr | mirror_rl | update_lr | update_rl
 pub fn build_plan(left: &str, right: &str, mode: &str) -> Result<SyncPlan, String> {
-    let cmp = compare_folders(left, right)?;
+    let cmp = compare_folders_simple(left, right, false)?;
     let mut actions = Vec::new();
     for n in &cmp.root {
         walk(n, mode, &mut actions);

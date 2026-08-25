@@ -4,8 +4,25 @@ use engine::diff::{DiffResult, FileMeta};
 use engine::folder::FolderCompareResult;
 use engine::merge::MergeResult;
 use engine::sync::{ApplyResult, SyncAction, SyncPlan};
+use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
+use tauri::{Emitter, Manager};
+
+/// Cancellation flags for in-flight folder comparisons, keyed by a job id
+/// generated on the frontend. Held in Tauri managed state.
+#[derive(Default)]
+struct CompareJobs(Mutex<HashMap<u64, Arc<AtomicBool>>>);
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompareProgress {
+    job_id: u64,
+    done: u64,
+}
 
 fn file_meta(path: &str) -> Option<FileMeta> {
     let m = fs::metadata(path).ok()?;
@@ -22,8 +39,55 @@ fn file_meta(path: &str) -> Option<FileMeta> {
 }
 
 #[tauri::command]
-fn compare_folders(left: String, right: String) -> Result<FolderCompareResult, String> {
-    engine::folder::compare_folders(&left, &right)
+async fn compare_folders(
+    window: tauri::Window,
+    jobs: tauri::State<'_, CompareJobs>,
+    left: String,
+    right: String,
+    exact: bool,
+    job_id: u64,
+) -> Result<FolderCompareResult, String> {
+    // Register a cancellation flag for this job.
+    let cancel = Arc::new(AtomicBool::new(false));
+    jobs.0.lock().unwrap().insert(job_id, cancel.clone());
+
+    // Persistent hash cache lives in the app cache dir; a failure to resolve it
+    // just means comparisons run without caching.
+    let cache_path = window
+        .app_handle()
+        .path()
+        .app_cache_dir()
+        .ok()
+        .map(|d| d.join("hashcache.bin"));
+
+    // Run the (CPU/IO-heavy) comparison on a blocking thread so the async
+    // runtime stays free to deliver the cancel command and progress events.
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let on_progress = move |done: u64| {
+            let _ = window.emit("folder-compare-progress", CompareProgress { job_id, done });
+        };
+        engine::folder::compare_folders(
+            &left,
+            &right,
+            exact,
+            cache_path.as_deref(),
+            &cancel,
+            &on_progress,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Always clean up the registry entry, whether we finished or were cancelled.
+    jobs.0.lock().unwrap().remove(&job_id);
+    result
+}
+
+#[tauri::command]
+fn cancel_compare(jobs: tauri::State<'_, CompareJobs>, job_id: u64) {
+    if let Some(flag) = jobs.0.lock().unwrap().get(&job_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[tauri::command]
@@ -92,8 +156,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .manage(CompareJobs::default())
         .invoke_handler(tauri::generate_handler![
             compare_folders,
+            cancel_compare,
             diff_text,
             diff_files,
             merge3,

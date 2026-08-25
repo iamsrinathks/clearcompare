@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 
 // ---- Types mirroring the Rust engine ----
@@ -111,9 +112,60 @@ export type SyncMode =
 
 // ---- Command wrappers ----
 
+/** A running folder comparison you can await and cancel. */
+export interface FolderCompareHandle {
+  jobId: number;
+  result: Promise<FolderCompareResult>;
+  cancel: () => void;
+}
+
+let compareJobSeq = 0;
+
+/**
+ * Start a folder comparison that streams progress and can be cancelled.
+ * `onProgress` receives the running count of files examined.
+ */
+export function startFolderCompare(
+  left: string,
+  right: string,
+  exact = false,
+  onProgress?: (done: number) => void,
+): FolderCompareHandle {
+  const jobId = ++compareJobSeq;
+  let unlisten: (() => void) | undefined;
+
+  const result = (async () => {
+    if (onProgress) {
+      unlisten = await listen<{ jobId: number; done: number }>(
+        "folder-compare-progress",
+        (e) => {
+          if (e.payload.jobId === jobId) onProgress(e.payload.done);
+        },
+      );
+    }
+    try {
+      return await invoke<FolderCompareResult>("compare_folders", {
+        left,
+        right,
+        exact,
+        jobId,
+      });
+    } finally {
+      unlisten?.();
+    }
+  })();
+
+  const cancel = () => {
+    void invoke("cancel_compare", { jobId }).catch(() => {});
+  };
+
+  return { jobId, result, cancel };
+}
+
 export const api = {
-  compareFolders: (left: string, right: string) =>
-    invoke<FolderCompareResult>("compare_folders", { left, right }),
+  /** @deprecated prefer startFolderCompare for progress + cancellation */
+  compareFolders: (left: string, right: string, exact = false) =>
+    startFolderCompare(left, right, exact),
   diffText: (left: string, right: string, ignoreWhitespace = false) =>
     invoke<DiffResult>("diff_text", { left, right, ignoreWhitespace }),
   diffFiles: (leftPath: string, rightPath: string, ignoreWhitespace = false) =>

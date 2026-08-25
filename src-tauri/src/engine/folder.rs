@@ -1,10 +1,43 @@
+use super::cache::HashCache;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
+
+/// Emit a progress event roughly every this many files processed, to avoid
+/// flooding the IPC channel while still feeling live.
+const PROGRESS_EVERY: u64 = 512;
+
+/// Shared, thread-safe context threaded through the (parallel) comparison.
+pub struct Ctx<'a> {
+    pub exact: bool,
+    /// Set to true from another thread to request cancellation.
+    pub cancel: &'a AtomicBool,
+    /// Running count of files examined so far.
+    pub done: &'a AtomicU64,
+    /// Called (throttled) with the running count so the UI can show progress.
+    pub on_progress: &'a (dyn Fn(u64) + Send + Sync),
+    /// Optional persistent hash cache (used for exact content comparisons).
+    pub cache: Option<&'a HashCache>,
+}
+
+impl Ctx<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Record one processed file and emit a throttled progress update.
+    fn tick(&self) {
+        let n = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % PROGRESS_EVERY == 0 {
+            (self.on_progress)(n);
+        }
+    }
+}
 
 #[derive(Serialize, Clone)]
 pub struct SideMeta {
@@ -97,18 +130,67 @@ fn hash_file(path: &Path) -> Option<[u8; 32]> {
     Some(*hasher.finalize().as_bytes())
 }
 
-fn files_equal(left: &Path, right: &Path, size_a: u64, size_b: u64) -> bool {
-    if size_a != size_b {
+/// Hash a file, consulting the persistent cache first when one is present.
+fn hash_cached(ctx: &Ctx, path: &Path, size: u64, mtime: i64) -> Option<[u8; 32]> {
+    match ctx.cache {
+        Some(c) => c.get_or_compute(path, size, mtime, || hash_file(path)),
+        None => hash_file(path),
+    }
+}
+
+/// True when both files have identical BLAKE3 content hashes.
+#[allow(clippy::too_many_arguments)]
+fn contents_equal(
+    ctx: &Ctx,
+    left: &Path,
+    ls: u64,
+    lm: i64,
+    right: &Path,
+    rs: u64,
+    rm: i64,
+) -> bool {
+    if ls != rs {
         return false;
     }
-    match (hash_file(left), hash_file(right)) {
+    match (
+        hash_cached(ctx, left, ls, lm),
+        hash_cached(ctx, right, rs, rm),
+    ) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
 }
 
+/// Fast path: files with identical size *and* modification time are treated as
+/// equal without reading their contents. This avoids hashing the (common) case
+/// of millions of unchanged files. Only when the mtimes differ do we fall back
+/// to a full BLAKE3 content comparison.
+#[allow(clippy::too_many_arguments)]
+fn quick_equal(
+    ctx: &Ctx,
+    left: &Path,
+    ls: u64,
+    lm: i64,
+    right: &Path,
+    rs: u64,
+    rm: i64,
+) -> bool {
+    if ls != rs {
+        return false;
+    }
+    if lm == rm {
+        return true;
+    }
+    contents_equal(ctx, left, ls, lm, right, rs, rm)
+}
+
 /// Recursively compare two directories. `rel` is the path relative to the roots.
-fn compare_dirs(left: &Path, right: &Path, rel: &str, stats: &mut Stats) -> Vec<Node> {
+/// When `ctx.exact` is true, files are always compared by BLAKE3 content; otherwise
+/// a size+mtime quick path is used to skip hashing unchanged files.
+fn compare_dirs(left: &Path, right: &Path, rel: &str, ctx: &Ctx, stats: &mut Stats) -> Vec<Node> {
+    if ctx.cancelled() {
+        return vec![];
+    }
     let le = read_dir_entries(left);
     let re = read_dir_entries(right);
 
@@ -128,7 +210,7 @@ fn compare_dirs(left: &Path, right: &Path, rel: &str, stats: &mut Stats) -> Vec<
             } else {
                 format!("{}/{}", rel, name)
             };
-            let node = build_node(left, right, name, &child_rel, l, r, &mut local);
+            let node = build_node(left, right, name, &child_rel, l, r, ctx, &mut local);
             (node, local)
         })
         .collect();
@@ -159,6 +241,7 @@ fn build_node(
     rel: &str,
     l: Option<&RawEntry>,
     r: Option<&RawEntry>,
+    ctx: &Ctx,
     stats: &mut Stats,
 ) -> Node {
     let is_dir = l.map(|e| e.is_dir).or(r.map(|e| e.is_dir)).unwrap_or(false);
@@ -176,9 +259,9 @@ fn build_node(
         let lpath = left_dir.join(name);
         let rpath = right_dir.join(name);
         let children = match (l, r) {
-            (Some(_), Some(_)) => compare_dirs(&lpath, &rpath, rel, stats),
-            (Some(_), None) => list_only(&lpath, rel, Side::Left, stats),
-            (None, Some(_)) => list_only(&rpath, rel, Side::Right, stats),
+            (Some(_), Some(_)) => compare_dirs(&lpath, &rpath, rel, ctx, stats),
+            (Some(_), None) => list_only(&lpath, rel, Side::Left, ctx, stats),
+            (None, Some(_)) => list_only(&rpath, rel, Side::Right, ctx, stats),
             (None, None) => vec![],
         };
         let diff_count: u32 = children
@@ -215,12 +298,17 @@ fn build_node(
     } else {
         let status = match (l, r) {
             (Some(le), Some(re)) => {
-                let eq = files_equal(
-                    &left_dir.join(name),
-                    &right_dir.join(name),
-                    le.size,
-                    re.size,
-                );
+                ctx.tick();
+                let lpath = left_dir.join(name);
+                let rpath = right_dir.join(name);
+                // Skip the (potentially expensive) content read if we're aborting.
+                let eq = if ctx.cancelled() {
+                    true
+                } else if ctx.exact {
+                    contents_equal(ctx, &lpath, le.size, le.mtime, &rpath, re.size, re.mtime)
+                } else {
+                    quick_equal(ctx, &lpath, le.size, le.mtime, &rpath, re.size, re.mtime)
+                };
                 if eq {
                     stats.same += 1;
                     "same".to_string()
@@ -267,7 +355,10 @@ enum Side {
 }
 
 /// Build a tree for a directory that only exists on one side.
-fn list_only(dir: &Path, rel: &str, side: Side, stats: &mut Stats) -> Vec<Node> {
+fn list_only(dir: &Path, rel: &str, side: Side, ctx: &Ctx, stats: &mut Stats) -> Vec<Node> {
+    if ctx.cancelled() {
+        return vec![];
+    }
     let entries = read_dir_entries(dir);
     let mut nodes = vec![];
     for (name, e) in entries {
@@ -281,10 +372,11 @@ fn list_only(dir: &Path, rel: &str, side: Side, stats: &mut Stats) -> Vec<Node> 
             Side::Right => (None, Some(meta), "right_only"),
         };
         let (children, diff_count) = if e.is_dir {
-            let ch = list_only(&dir.join(&name), &child_rel, side, stats);
+            let ch = list_only(&dir.join(&name), &child_rel, side, ctx, stats);
             let dc = ch.iter().map(|c| if c.is_dir { c.diff_count } else { 1 }).sum();
             (ch, dc)
         } else {
+            ctx.tick();
             match side {
                 Side::Left => stats.left_only += 1,
                 Side::Right => stats.right_only += 1,
@@ -310,7 +402,28 @@ fn list_only(dir: &Path, rel: &str, side: Side, stats: &mut Stats) -> Vec<Node> 
     nodes
 }
 
-pub fn compare_folders(left: &str, right: &str) -> Result<FolderCompareResult, String> {
+/// Sentinel error returned when a comparison is cancelled mid-flight.
+pub const CANCELLED: &str = "cancelled";
+
+/// Convenience wrapper for callers (e.g. sync planning) that don't need
+/// progress reporting, cancellation, or a persistent hash cache.
+pub fn compare_folders_simple(
+    left: &str,
+    right: &str,
+    exact: bool,
+) -> Result<FolderCompareResult, String> {
+    let cancel = AtomicBool::new(false);
+    compare_folders(left, right, exact, None, &cancel, &|_| {})
+}
+
+pub fn compare_folders(
+    left: &str,
+    right: &str,
+    exact: bool,
+    cache_path: Option<&Path>,
+    cancel: &AtomicBool,
+    on_progress: &(dyn Fn(u64) + Send + Sync),
+) -> Result<FolderCompareResult, String> {
     let lp = Path::new(left);
     let rp = Path::new(right);
     if !lp.is_dir() {
@@ -319,8 +432,35 @@ pub fn compare_folders(left: &str, right: &str) -> Result<FolderCompareResult, S
     if !rp.is_dir() {
         return Err(format!("Not a folder: {}", right));
     }
+    // Only bother with the on-disk hash cache for exact comparisons, since the
+    // quick path rarely hashes anything.
+    let cache = if exact {
+        cache_path.map(HashCache::load)
+    } else {
+        None
+    };
+    let done = AtomicU64::new(0);
+    let ctx = Ctx {
+        exact,
+        cancel,
+        done: &done,
+        on_progress,
+        cache: cache.as_ref(),
+    };
     let mut stats = Stats::default();
-    let root = compare_dirs(lp, rp, "", &mut stats);
+    let root = compare_dirs(lp, rp, "", &ctx, &mut stats);
+
+    // Persist any newly computed hashes even if we were cancelled mid-run.
+    if let Some(c) = &cache {
+        c.save();
+    }
+
+    if ctx.cancelled() {
+        return Err(CANCELLED.to_string());
+    }
+    // Final progress tick so the UI lands on the true total.
+    (on_progress)(done.load(Ordering::Relaxed));
+
     Ok(FolderCompareResult {
         left_root: left.to_string(),
         right_root: right.to_string(),

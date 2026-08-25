@@ -145,7 +145,8 @@ export default function FolderSync() {
         <PathPicker
           label="Left"
           value={left}
-          placeholder="Choose left folder…"
+          placeholder="Type or paste a folder path…"
+          onChange={setLeft}
           onPick={async () => {
             const p = await pickFolder("Left folder");
             if (p) setLeft(p);
@@ -154,7 +155,8 @@ export default function FolderSync() {
         <PathPicker
           label="Right"
           value={right}
-          placeholder="Choose right folder…"
+          placeholder="Type or paste a folder path…"
+          onChange={setRight}
           onPick={async () => {
             const p = await pickFolder("Right folder");
             if (p) setRight(p);

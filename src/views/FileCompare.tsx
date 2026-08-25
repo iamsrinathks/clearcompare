@@ -22,10 +22,13 @@ import {
   IconReload,
   IconSame,
   IconSessions,
+  IconSplitH,
+  IconSplitV,
   IconSwap,
 } from "../components/Icons";
 
 type Filter = "all" | "diffs" | "same";
+type Layout = "split" | "unified";
 const CTX = 2;
 const ROW_H = 20; // px, matches leading-5
 
@@ -47,6 +50,7 @@ export default function FileCompare() {
   const [collapse, setCollapse] = useState(false);
   const [ignoreWs, setIgnoreWs] = useState(false);
   const [leftPct, setLeftPct] = useState(50);
+  const [layout, setLayout] = useState<Layout>("split");
 
   const vscroll = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -226,6 +230,9 @@ export default function FileCompare() {
       { label: "Collapse unchanged", checked: collapse, onClick: () => setCollapse((v) => !v) },
       { label: "Ignore whitespace", checked: ignoreWs, onClick: toggleIgnoreWs },
       { separator: true },
+      { label: "Side by side", checked: layout === "split", onClick: () => setLayout("split") },
+      { label: "Stacked (unified)", checked: layout === "unified", onClick: () => setLayout("unified") },
+      { separator: true },
       { label: "Center split", onClick: () => setLeftPct(50) },
     ],
   });
@@ -241,6 +248,14 @@ export default function FileCompare() {
       <ToolDivider />
       <ToolButton icon={<IconContext />} label="Context" active={collapse} onClick={() => setCollapse((v) => !v)} title="Collapse unchanged lines" />
       <ToolButton icon={<IconMinor />} label="Minor" active={ignoreWs} onClick={toggleIgnoreWs} title="Ignore whitespace differences" />
+      <ToolDivider />
+      <ToolButton
+        icon={layout === "split" ? <IconSplitV /> : <IconSplitH />}
+        label={layout === "split" ? "Stacked" : "Side by side"}
+        active={layout === "unified"}
+        onClick={() => setLayout((v) => (v === "split" ? "unified" : "split"))}
+        title={layout === "split" ? "Switch to stacked (unified) view" : "Switch to side-by-side view"}
+      />
       <ToolDivider />
       <ToolButton icon={<IconCopyRight />} label="Copy →" onClick={() => copyOver("lr")} disabled={!diff} title="Overwrite right with left" />
       <ToolButton icon={<IconCopyLeft />} label="← Copy" onClick={() => copyOver("rl")} disabled={!diff} title="Overwrite left with right" />
@@ -265,6 +280,10 @@ export default function FileCompare() {
         right={right}
         leftMeta={diff?.left_meta ?? null}
         rightMeta={diff?.right_meta ?? null}
+        onChangeLeft={setLeft}
+        onChangeRight={setRight}
+        onCommitLeft={(v) => v && right && run(v, right)}
+        onCommitRight={(v) => v && left && run(left, v)}
         onPickLeft={async () => {
           const p = await pickFile("Left file");
           if (p) {
@@ -291,6 +310,54 @@ export default function FileCompare() {
         {diff && (
           <>
             <div ref={vscroll} className="h-full overflow-y-auto pr-2.5">
+              {layout === "unified" ? (
+                <div ref={containerRef} className="min-h-full overflow-x-auto">
+                  {items.map((it, i) =>
+                    it.type === "gap" ? (
+                      <GapLine key={`ug${i}`} count={it.count} />
+                    ) : it.row.kind === "equal" ? (
+                      <Line
+                        key={`ue${it.index}`}
+                        cell={it.row.right ?? it.row.left}
+                        kind="equal"
+                        side="right"
+                        active={false}
+                        refCb={(el) => (rowRefs.current[it.index] = el)}
+                      />
+                    ) : (
+                      <div
+                        key={`u${it.index}`}
+                        ref={(el) => (rowRefs.current[it.index] = el)}
+                      >
+                        {it.row.left && (
+                          <Line
+                            cell={it.row.left}
+                            kind={it.row.kind === "insert" ? "insert" : "delete"}
+                            side="left"
+                            active={
+                              !!activeRange &&
+                              it.index >= activeRange[0] &&
+                              it.index < activeRange[1]
+                            }
+                          />
+                        )}
+                        {it.row.right && (
+                          <Line
+                            cell={it.row.right}
+                            kind={it.row.kind === "delete" ? "delete" : "insert"}
+                            side="right"
+                            active={
+                              !!activeRange &&
+                              it.index >= activeRange[0] &&
+                              it.index < activeRange[1]
+                            }
+                          />
+                        )}
+                      </div>
+                    ),
+                  )}
+                </div>
+              ) : (
               <div ref={containerRef} className="flex min-h-full">
                 {/* LEFT pane */}
                 <div
@@ -353,6 +420,7 @@ export default function FileCompare() {
                   )}
                 </div>
               </div>
+              )}
             </div>
 
             {/* Diff minimap */}
@@ -525,6 +593,10 @@ function PathInfoBar({
   rightMeta,
   onPickLeft,
   onPickRight,
+  onChangeLeft,
+  onChangeRight,
+  onCommitLeft,
+  onCommitRight,
 }: {
   left: string;
   right: string;
@@ -532,19 +604,44 @@ function PathInfoBar({
   rightMeta: FileMeta | null;
   onPickLeft: () => void;
   onPickRight: () => void;
+  onChangeLeft: (value: string) => void;
+  onChangeRight: (value: string) => void;
+  onCommitLeft: (value: string) => void;
+  onCommitRight: (value: string) => void;
 }) {
-  const side = (path: string, meta: FileMeta | null, onPick: () => void) => (
+  const side = (
+    path: string,
+    meta: FileMeta | null,
+    onPick: () => void,
+    onChange: (value: string) => void,
+    onCommit: (value: string) => void,
+  ) => (
     <div className="min-w-0 flex-1">
-      <button
-        onClick={onPick}
-        className="flex w-full items-center gap-2 truncate rounded border border-neutral-200 bg-neutral-50 px-2 py-1 text-left font-mono text-xs text-neutral-700 hover:border-neutral-300 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300"
-        title={path}
-      >
+      <div className="flex w-full items-center gap-2 rounded border border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-xs text-neutral-700 focus-within:border-neutral-300 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300">
         <span className="shrink-0 text-neutral-400">🗎</span>
-        <span className="truncate">
-          {path || <span className="text-neutral-400">Choose file…</span>}
-        </span>
-      </button>
+        <input
+          value={path}
+          spellCheck={false}
+          placeholder="Type or paste a file path…"
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onCommit(path);
+              (e.target as HTMLInputElement).blur();
+            }
+          }}
+          title={path}
+          className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-neutral-400"
+        />
+        <button
+          onClick={onPick}
+          title="Browse…"
+          className="shrink-0 text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
+        >
+          📁
+        </button>
+      </div>
       <div className="mt-0.5 flex items-center gap-3 px-1 text-[11px] text-neutral-400">
         {meta ? (
           <>
@@ -561,8 +658,8 @@ function PathInfoBar({
   );
   return (
     <div className="flex items-start gap-3 border-b border-neutral-200 px-3 py-2 dark:border-neutral-800">
-      {side(left, leftMeta, onPickLeft)}
-      {side(right, rightMeta, onPickRight)}
+      {side(left, leftMeta, onPickLeft, onChangeLeft, onCommitLeft)}
+      {side(right, rightMeta, onPickRight, onChangeRight, onCommitRight)}
     </div>
   );
 }

@@ -93,6 +93,28 @@ export const IconSwap = (p: SVGProps<SVGSVGElement>) => (
     <path d="M21 16H7" />
   </svg>
 );
+export const IconStop = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <rect x="6" y="6" width="12" height="12" rx="1.5" />
+  </svg>
+);
+export const IconHash = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <path d="M9 4L7 20M17 4l-2 16M4 9h16M3 15h16" />
+  </svg>
+);
+export const IconSplitH = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M12 4v16" />
+  </svg>
+);
+export const IconSplitV = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M3 12h18" />
+  </svg>
+);
 export const IconReload = (p: SVGProps<SVGSVGElement>) => (
   <svg {...base(p)}>
     <path d="M20 11a8 8 0 1 0-2 6" />

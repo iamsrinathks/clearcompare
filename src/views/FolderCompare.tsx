@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  api,
   FolderCompareResult,
   Node,
   pickFolder,
   SideMeta,
+  startFolderCompare,
 } from "../lib/api";
 import { formatDate, formatSize } from "../lib/format";
 import { statusColor, statusRowBg } from "../lib/status";
@@ -19,12 +19,19 @@ import {
 import {
   IconAll,
   IconDiffs,
+  IconHash,
   IconHome,
   IconReload,
   IconSessions,
+  IconStop,
   IconSwap,
 } from "../components/Icons";
 import { PathPicker } from "../components/Shell";
+
+// Fixed row height (px) so the tree can be virtualized. Must match the height
+// applied in <Row>.
+const ROW_H = 24;
+const OVERSCAN = 8;
 
 export default function FolderCompare() {
   const openFilePair = useApp((s) => s.openFilePair);
@@ -37,14 +44,27 @@ export default function FolderCompare() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [onlyDiffs, setOnlyDiffs] = useState(false);
+  const [exact, setExact] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [progress, setProgress] = useState(0);
+  // cancel fn for the in-flight comparison, if any
+  const cancelRef = useRef<(() => void) | null>(null);
+  // virtual scrolling state for the (potentially huge) tree
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewH, setViewH] = useState(0);
 
-  async function run(l = left, r = right) {
+  async function run(l = left, r = right, ex = exact) {
     if (!l || !r) return;
+    // Supersede any comparison already running.
+    cancelRef.current?.();
     setLoading(true);
     setError(null);
+    setProgress(0);
+    const handle = startFolderCompare(l, r, ex, setProgress);
+    cancelRef.current = handle.cancel;
     try {
-      const res = await api.compareFolders(l, r);
+      const res = await handle.result;
       setResult(res);
       addRecent({ kind: "folder", left: l, right: r });
       const next = new Set<string>();
@@ -52,12 +72,22 @@ export default function FolderCompare() {
         if (n.is_dir && n.diff_count > 0) next.add(n.rel_path);
       setExpanded(next);
     } catch (e) {
+      // A cancelled run rejects with "cancelled"; keep prior results silently.
+      if (String(e).includes("cancelled")) return;
       setError(String(e));
       setResult(null);
     } finally {
+      cancelRef.current = null;
       setLoading(false);
     }
   }
+
+  function cancel() {
+    cancelRef.current?.();
+  }
+
+  // Cancel any running comparison when leaving the view.
+  useEffect(() => () => cancelRef.current?.(), []);
 
   useEffect(() => {
     const p = consumePending("folder");
@@ -122,6 +152,37 @@ export default function FolderCompare() {
     return out;
   }, [result, expanded, onlyDiffs]);
 
+  // Track the scroll container's scroll position and height for virtualization.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => setScrollTop(el.scrollTop);
+    const ro = new ResizeObserver(() => setViewH(el.clientHeight));
+    el.addEventListener("scroll", onScroll, { passive: true });
+    ro.observe(el);
+    setViewH(el.clientHeight);
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      ro.disconnect();
+    };
+  }, []);
+
+  // Only render the rows currently in (or near) the viewport.
+  const total = visible.length * ROW_H;
+  const startIdx = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
+  const endIdx = Math.min(
+    visible.length,
+    Math.ceil((scrollTop + viewH) / ROW_H) + OVERSCAN,
+  );
+  const windowed = visible.slice(startIdx, endIdx);
+  const offsetY = startIdx * ROW_H;
+
+  function toggleExact() {
+    const v = !exact;
+    setExact(v);
+    if (left && right) run(left, right, v);
+  }
+
   const menus = useStandardMenus({
     File: [
       { label: "Compare", shortcut: "⌘↵", onClick: () => run(), disabled: !left || !right },
@@ -133,6 +194,9 @@ export default function FolderCompare() {
       { separator: true },
       { label: "Expand all", onClick: () => expandAll(result, setExpanded), disabled: !result },
       { label: "Collapse all", onClick: () => setExpanded(new Set()), disabled: !result },
+      { separator: true },
+      { label: "Quick compare (size + modified time)", checked: !exact, onClick: () => exact && toggleExact() },
+      { label: "Exact compare (hash contents)", checked: exact, onClick: () => !exact && toggleExact() },
     ],
   });
 
@@ -144,8 +208,29 @@ export default function FolderCompare() {
       <ToolButton icon={<IconAll />} label="All" active={!onlyDiffs} onClick={() => setOnlyDiffs(false)} />
       <ToolButton icon={<IconDiffs />} label="Diffs" active={onlyDiffs} onClick={() => setOnlyDiffs(true)} />
       <ToolDivider />
+      <ToolButton
+        icon={<IconHash />}
+        label="Exact"
+        active={exact}
+        onClick={toggleExact}
+        title={
+          exact
+            ? "Exact: comparing file contents by hash"
+            : "Quick: comparing by size + modified time (click for exact hash compare)"
+        }
+      />
+      <ToolDivider />
       <ToolButton icon={<IconSwap />} label="Swap" onClick={swap} disabled={!left || !right} />
-      <ToolButton icon={<IconReload />} label={loading ? "…" : "Compare"} onClick={() => run()} disabled={!left || !right} />
+      {loading ? (
+        <ToolButton icon={<IconStop />} label="Cancel" onClick={cancel} />
+      ) : (
+        <ToolButton icon={<IconReload />} label="Compare" onClick={() => run()} disabled={!left || !right} />
+      )}
+      {loading && (
+        <div className="ml-auto pr-1 text-xs text-neutral-400">
+          Comparing… {progress.toLocaleString()} files
+        </div>
+      )}
     </>
   );
 
@@ -155,7 +240,9 @@ export default function FolderCompare() {
         <PathPicker
           label="Left"
           value={left}
-          placeholder="Choose left folder…"
+          placeholder="Type or paste a folder path…"
+          onChange={setLeft}
+          onCommit={(v) => v && right && run(v, right)}
           onPick={async () => {
             const p = await pickFolder("Left folder");
             if (p) {
@@ -167,7 +254,9 @@ export default function FolderCompare() {
         <PathPicker
           label="Right"
           value={right}
-          placeholder="Choose right folder…"
+          placeholder="Type or paste a folder path…"
+          onChange={setRight}
+          onCommit={(v) => v && left && run(left, v)}
           onPick={async () => {
             const p = await pickFolder("Right folder");
             if (p) {
@@ -185,22 +274,35 @@ export default function FolderCompare() {
         <div className="w-40 text-right">Right modified</div>
       </div>
 
-      <div className="flex-1 overflow-auto font-mono text-[13px]">
+      <div ref={scrollRef} className="flex-1 overflow-auto font-mono text-[13px]">
         {error && <div className="p-4 text-sm text-red-500">{error}</div>}
-        {!result && !error && (
+        {loading && !result && (
+          <div className="p-8 text-center text-sm text-neutral-400">
+            Comparing… {progress.toLocaleString()} files examined
+          </div>
+        )}
+        {!result && !error && !loading && (
           <div className="p-8 text-center text-sm text-neutral-400">
             Pick a left and right folder to compare.
           </div>
         )}
-        {visible.map(({ node, depth }) => (
-          <Row
-            key={node.rel_path}
-            node={node}
-            depth={depth}
-            expanded={expanded.has(node.rel_path)}
-            onActivate={() => onRowActivate(node)}
-          />
-        ))}
+        {visible.length > 0 && (
+          // Spacer sized to the full list; only the windowed rows are mounted,
+          // shifted into place so scrolling stays correct.
+          <div style={{ height: total }} className="relative">
+            <div style={{ transform: `translateY(${offsetY}px)` }}>
+              {windowed.map(({ node, depth }) => (
+                <Row
+                  key={node.rel_path}
+                  node={node}
+                  depth={depth}
+                  expanded={expanded.has(node.rel_path)}
+                  onActivate={() => onRowActivate(node)}
+                />
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="flex h-7 shrink-0 items-center gap-4 border-t border-neutral-200 px-3 text-xs text-neutral-500 dark:border-neutral-800 dark:text-neutral-400">
@@ -255,8 +357,9 @@ function Row({
   return (
     <div
       onClick={onActivate}
+      style={{ height: ROW_H }}
       className={
-        "flex items-center px-3 py-[3px] " +
+        "flex items-center px-3 " +
         statusRowBg(node.status) +
         (clickable
           ? " cursor-pointer hover:bg-neutral-100 dark:hover:bg-neutral-800/60"

@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod folder;
 pub mod diff;
 pub mod merge;
